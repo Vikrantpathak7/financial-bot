@@ -169,7 +169,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if category_key == "main_menu":
         # This now works because the 'start' function can handle the 'query' object.
-        await start(query, context) # Pass the CallbackQuery object to the start function
+        await start(update, context) # Pass the CallbackQuery object to the start function
         return
 
     if category_key in FINANCIAL_LINKS:
