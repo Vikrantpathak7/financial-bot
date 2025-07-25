@@ -1,6 +1,6 @@
 import logging
 import os
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # Enable logging
@@ -114,7 +114,10 @@ FINANCIAL_LINKS = {
 
 # --- Telegram Bot Commands ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ***** EDITED FUNCTION *****
+# The 'start' function now accepts either an 'Update' or a 'CallbackQuery' object.
+# This makes it flexible enough to be called by a command (/start) or a button press ("Back to Main Menu").
+async def start(update: Update | CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message with a menu of categories."""
     keyboard = []
     # Create a button for each category, sorted for consistency
@@ -131,27 +134,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Please select a category below to get started:"
     )
     
-    # Send the message with the buttons
-    # This logic handles both /start command and "Back to Menu" button clicks
-    if update.callback_query:
-        await update.callback_query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    # This logic checks what kind of object 'update' is.
+    if isinstance(update, CallbackQuery):
+        # This block runs if 'start' was called from a button press.
+        # 'update' is the CallbackQuery object itself.
+        query = update
+        await query.answer() # Acknowledge the button press
+        await query.edit_message_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    elif isinstance(update, Update) and update.message:
+        # This block runs if 'start' was called by a command like /start.
+        # 'update' is the full Update object.
+        await update.message.reply_text(
+            welcome_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The /help command will now just show the main menu again."""
+    # This correctly passes the full Update object to the start function.
     await start(update, context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles button clicks from the main menu."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the button press
+    await query.answer()  # Acknowledge the button press immediately
 
     category_key = query.data
     
     if category_key == "main_menu":
-        await start(query, context) # Pass the query to the start function
+        # This now works because the 'start' function can handle the 'query' object.
+        await start(query, context) # Pass the CallbackQuery object to the start function
         return
 
     if category_key in FINANCIAL_LINKS:
@@ -162,31 +180,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             message += f"🔗 [{link['name']}]({link['url']})\n"
             message += f"   - {link['desc']}\n\n"
             
+        # Create the "Back to Menu" button
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Edit the message text and the reply markup in two steps.
+        # First, update the text to show the links.
         await query.edit_message_text(
             text=message,
             parse_mode='Markdown',
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=reply_markup # Add the button at the same time
         )
-        # Add a "Back to Menu" button
-        keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_reply_markup(reply_markup)
+
 
 def main() -> None:
     """Start the bot."""
-    # --- IMPORTANT ---
-    # For local testing, paste your token in the quotes below.
-    # For deployment, the token should be set as an environment variable.
-    TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk"
+    # --- IMPROVED TOKEN HANDLING ---
+    # It's recommended to use an environment variable for your bot token for security.
+    # Name the environment variable "BOT_TOKEN".
+    TOKEN = os.environ.get("BOT_TOKEN")
 
-    # This logic allows the code to work both locally and when deployed.
-    # It will prioritize the environment variable if it exists.
-    env_token = os.environ.get("8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk")
-    if env_token:
-        TOKEN = os.environ.get("BOT_TOKEN")
+    # If you are testing locally and don't want to set environment variables,
+    # you can uncomment the following line and paste your token.
+     TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEkd" 
 
-    if not TOKEN :
-        logging.error("ERROR: Your bot token is not set. Please paste it into the TOKEN variable in the code.")
+    if not TOKEN:
+        logging.error("ERROR: Bot token not found. Please set the 'BOT_TOKEN' environment variable or paste it directly into the code.")
         return
         
     application = Application.builder().token(TOKEN).build()
