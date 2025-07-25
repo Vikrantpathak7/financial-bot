@@ -203,7 +203,7 @@ def main() -> None:
 
     # If you are testing locally and don't want to set environment variables,
     # you can uncomment the following line and paste your token.
-    TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEkd" 
+    TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk" 
 
     if not TOKEN:
         logging.error("ERROR: Bot token not found. Please set the 'BOT_TOKEN' environment variable or paste it directly into the code.")
