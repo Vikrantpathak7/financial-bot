@@ -1,5 +1,6 @@
 import logging
 import os
+import sqlite3 # ### NEW ### - Import the SQLite library
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
@@ -8,8 +9,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
+# ### NEW ### - Add your Telegram User ID here. This is for the secure /stats command.
+# You can get your ID by messaging @userinfobot on Telegram.
+OWNER_ID =1727394308 # <<< IMPORTANT: REPLACE 0 WITH YOUR ACTUAL TELEGRAM USER ID
+
 # --- Financial Resources ---
-# Each category now has an emoji and a 'description' to guide the user.
 FINANCIAL_LINKS = {
     "ipo_resources": {
         "title": "🚀 IPO Resources",
@@ -112,19 +116,53 @@ FINANCIAL_LINKS = {
     }
 }
 
+
+# ### NEW ### - Function to set up the database
+def setup_database():
+    """Creates the database and the users table if they don't exist."""
+    conn = sqlite3.connect("bot_users.db")
+    cursor = conn.cursor()
+    # Create table to store user info. user_id is the PRIMARY KEY, so it must be unique.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_seen TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
 # --- Telegram Bot Commands ---
 
-# ***** EDITED FUNCTION *****
-# The 'start' function now accepts either an 'Update' or a 'CallbackQuery' object.
-# This makes it flexible enough to be called by a command (/start) or a button press ("Back to Main Menu").
 async def start(update: Update | CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message with a menu of categories."""
+    """Sends a welcome message and logs the user."""
+    
+    # ### NEW ### - User Logging Logic
+    user = None
+    if isinstance(update, CallbackQuery):
+        user = update.from_user
+    elif isinstance(update, Update) and update.message:
+        user = update.message.from_user
+        
+    if user:
+        conn = sqlite3.connect("bot_users.db")
+        cursor = conn.cursor()
+        # The "OR IGNORE" part is important. It tells SQLite to do nothing if the user_id already exists.
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, first_seen) VALUES (?, ?, datetime('now'))",
+            (user.id, user.username)
+        )
+        conn.commit()
+        conn.close()
+        logging.info(f"User {user.id} ({user.username}) started the bot or returned to the menu.")
+    # ### END NEW ###
+
     keyboard = []
-    # Create a button for each category, sorted for consistency
     sorted_keys = sorted(FINANCIAL_LINKS.keys())
     for key in sorted_keys:
         button = InlineKeyboardButton(FINANCIAL_LINKS[key]["title"], callback_data=key)
-        keyboard.append([button]) # Each button on its own row
+        keyboard.append([button])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -134,20 +172,15 @@ async def start(update: Update | CallbackQuery, context: ContextTypes.DEFAULT_TY
         "Please select a category below to get started:"
     )
     
-    # This logic checks what kind of object 'update' is.
     if isinstance(update, CallbackQuery):
-        # This block runs if 'start' was called from a button press.
-        # 'update' is the CallbackQuery object itself.
         query = update
-        await query.answer() # Acknowledge the button press
+        await query.answer()
         await query.edit_message_text(
             welcome_text,
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
     elif isinstance(update, Update) and update.message:
-        # This block runs if 'start' was called by a command like /start.
-        # 'update' is the full Update object.
         await update.message.reply_text(
             welcome_text,
             reply_markup=reply_markup,
@@ -157,19 +190,17 @@ async def start(update: Update | CallbackQuery, context: ContextTypes.DEFAULT_TY
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The /help command will now just show the main menu again."""
-    # This correctly passes the full Update object to the start function.
     await start(update, context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles button clicks from the main menu."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the button press immediately
+    await query.answer()
 
     category_key = query.data
     
     if category_key == "main_menu":
-        # This now works because the 'start' function can handle the 'query' object.
-        await start(query, context) # Pass the CallbackQuery object to the start function
+        await start(query, context)
         return
 
     if category_key in FINANCIAL_LINKS:
@@ -180,45 +211,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             message += f"🔗 [{link['name']}]({link['url']})\n"
             message += f"   - {link['desc']}\n\n"
             
-        # Create the "Back to Menu" button
         keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Edit the message text and the reply markup in two steps.
-        # First, update the text to show the links.
         await query.edit_message_text(
             text=message,
             parse_mode='Markdown',
             disable_web_page_preview=True,
-            reply_markup=reply_markup # Add the button at the same time
+            reply_markup=reply_markup
         )
+
+# ### NEW ### - Command for the bot owner to see stats
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the total number of users."""
+    user_id = update.message.from_user.id
+
+    if user_id == OWNER_ID:
+        conn = sqlite3.connect("bot_users.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        user_count = cursor.fetchone()[0]
+        conn.close()
+        await update.message.reply_text(f"📊 Total unique users: {user_count}")
+    else:
+        await update.message.reply_text("Sorry, this command is for the bot owner only.")
+# ### END NEW ###
 
 
 def main() -> None:
     """Start the bot."""
-    # --- IMPROVED TOKEN HANDLING ---
-    # It's recommended to use an environment variable for your bot token for security.
-    # Name the environment variable "BOT_TOKEN".
     TOKEN = os.environ.get("BOT_TOKEN")
-
-    # If you are testing locally and don't want to set environment variables,
-    # you can uncomment the following line and paste your token.
+    
+    # Paste your token here if you are not using environment variables
     TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk" 
 
     if not TOKEN:
-        logging.error("ERROR: Bot token not found. Please set the 'BOT_TOKEN' environment variable or paste it directly into the code.")
+        logging.error("ERROR: Bot token not found.")
         return
         
     application = Application.builder().token(TOKEN).build()
 
-    # Add handlers for start and help commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    
-    # Add handler for button clicks
     application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # ### NEW ### - Add the handler for the /stats command
+    application.add_handler(CommandHandler("stats", stats_command))
 
-    # Run the bot until the user presses Ctrl-C
+    # ### NEW ### - Run the database setup function once on startup
+    setup_database()
+
     application.run_polling()
 
 
