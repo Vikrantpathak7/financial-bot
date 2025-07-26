@@ -1,20 +1,29 @@
 import logging
 import os
-import sqlite3 # ### NEW ### - Import the SQLite library
+import sqlite3
+import yfinance as yf
+import requests
+import random
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 # Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ### NEW ### - Add your Telegram User ID here. This is for the secure /stats command.
-# You can get your ID by messaging @userinfobot on Telegram.
-OWNER_ID =1727394308 # <<< IMPORTANT: REPLACE 0 WITH YOUR ACTUAL TELEGRAM USER ID
-
-# --- Financial Resources ---
-FINANCIAL_LINKS = {
+# --- Constants ---
+OWNER_ID = 1727394308 # <<< IMPORTANT: REPLACE WITH YOUR ID
+QUIZ_QUESTIONS = [
+    {"question": "What does a high P/E Ratio generally signify?", "options": ["The stock is undervalued", "Investors expect high future growth", "The company has low debt"], "correct": 1, "explanation": "A high P/E ratio often indicates that investors are willing to pay a higher price for each unit of current earnings, usually because they expect earnings to grow significantly in the future."},
+    {"question": "What is 'dollar-cost averaging'?", "options": ["Buying stocks only with USD", "Investing a fixed amount of money at regular intervals", "Selling stocks to average your cost basis"], "correct": 1, "explanation": "Dollar-cost averaging is an investment strategy where you invest a total sum of money in small increments over time instead of all at once. The goal is to reduce the impact of volatility."},
+    {"question": "What is a 'blue-chip' stock?", "options": ["A stock that costs less than $1", "A stock from a new tech company", "A well-established, financially sound company"], "correct": 2, "explanation": "Blue-chip stocks are from large, reputable, and financially stable companies that have a long history of reliable performance."},
+    {"question": "What is the primary benefit of a Systematic Investment Plan (SIP)?", "options": ["Guaranteed high returns", "Lump-sum investment profit", "Averaging cost & disciplined investing"], "correct": 2, "explanation": "SIPs help you invest regularly, which fosters discipline and averages out your purchase cost over time, reducing the risk of market timing."},
+    {"question": "A mutual fund is essentially a...", "options": ["Type of savings account", "Pool of money from many investors", "Government bond"], "correct": 1, "explanation": "A mutual fund pools money from many people to invest in a diversified portfolio of stocks, bonds, or other assets."},
+    {"question": "A 'bear market' is characterized by...", "options": ["Rising stock prices and optimism", "Falling stock prices and pessimism", "Volatile but stable prices"], "correct": 1, "explanation": "A bear market is a period of prolonged price declines and widespread pessimism. A 'bull market' is the opposite."},
+    {"question": "The 'power of compounding' refers to...", "options": ["Earning returns on your initial investment only", "Combining different types of stocks", "Earning returns on both your principal and past returns"], "correct": 2, "explanation": "Compounding is the process where your investment returns themselves start generating their own returns, leading to exponential growth over time."}
+]
+FINANCIAL_LINKS =  {
     "ipo_resources": {
         "title": "🚀 IPO Resources",
         "description": "Track upcoming, live, and closed IPOs in the Indian market with these essential dashboards.",
@@ -116,153 +125,286 @@ FINANCIAL_LINKS = {
     }
 }
 
-
-# ### NEW ### - Function to set up the database
-def setup_database():
-    """Creates the database and the users table if they don't exist."""
-    conn = sqlite3.connect("bot_users.db")
+# --- Database Setup & Helpers ---
+def db_query(query: str, params: tuple = ()):
+    conn = sqlite3.connect("bot_users.db", check_same_thread=False)
     cursor = conn.cursor()
-    # Create table to store user info. user_id is the PRIMARY KEY, so it must be unique.
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_seen TEXT
-        )
-    """)
+    cursor.execute(query, params)
+    result = cursor.fetchall()
     conn.commit()
     conn.close()
+    return result
 
-# --- Telegram Bot Commands ---
+def setup_database():
+    db_query("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT)")
+    db_query("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            watchlist_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            ticker_symbol TEXT NOT NULL, UNIQUE(user_id, ticker_symbol)
+        )""")
 
-async def start(update: Update | CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message and logs the user."""
+def log_user(user):
+    if user: db_query("INSERT OR IGNORE INTO users (user_id, username, first_seen) VALUES (?, ?, datetime('now'))", (user.id, user.username))
+
+async def cleanup_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Deletes the last main message sent by the bot."""
+    if 'last_message_id' in context.user_data:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=context.user_data.pop('last_message_id'))
+        except BadRequest as e:
+            logging.warning(f"Could not delete message: {e}")
+
+# --- UI & Formatting Helper Functions ---
+def is_in_watchlist(user_id: int, ticker_symbol: str) -> bool:
+    res = db_query("SELECT 1 FROM watchlist WHERE user_id = ? AND ticker_symbol = ?", (user_id, ticker_symbol))
+    return bool(res)
+
+def create_stock_details_keyboard(ticker_symbol: str, user_id: int) -> InlineKeyboardMarkup:
+    summary_url = f"https://finance.yahoo.com/quote/{ticker_symbol}"
+    if is_in_watchlist(user_id, ticker_symbol):
+        watchlist_button = InlineKeyboardButton("➖ Remove from Watchlist", callback_data=f"remove_from_details_{ticker_symbol}")
+    else:
+        watchlist_button = InlineKeyboardButton("➕ Add to Watchlist", callback_data=f"add_from_details_{ticker_symbol}")
+    keyboard = [[InlineKeyboardButton("📊 Full Report (Yahoo Finance)", url=summary_url)], [watchlist_button], [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
+    return InlineKeyboardMarkup(keyboard)
+
+async def get_stock_price_message(ticker_symbol: str) -> str:
+    try:
+        info = yf.Ticker(ticker_symbol).info
+        current_price = info.get('regularMarketPrice')
+        if current_price is None: return f"Could not find data for `'{ticker_symbol}'`."
+        currency_code = info.get('currency', ''); display_symbol = {'INR': '₹', 'USD': '$'}.get(currency_code, currency_code)
+        company_name = info.get('longName', 'N/A'); change = info.get('regularMarketChange', 0); percent_change = info.get('regularMarketChangePercent', 0) * 100
+        emoji = "📈" if change >= 0 else "📉"
+        return (f"**{company_name} ({ticker_symbol})** {emoji}\n\n"
+                f"**Live Price:** {display_symbol}{current_price:,.2f}\n"
+                f"**Change:** {change:+.2f} ({percent_change:+.2f}%)\n"
+                f"Click buttons below for a full report or to manage your watchlist.")
+    except Exception as e:
+        logging.error(f"Error in get_stock_price_message: {e}")
+        return "Sorry, an error occurred while fetching the price."
+
+# --- Main Command Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if user: log_user(user)
+
+    await cleanup_previous_message(context, chat_id)
     
-    # ### NEW ### - User Logging Logic
-    user = None
-    if isinstance(update, CallbackQuery):
-        user = update.from_user
-    elif isinstance(update, Update) and update.message:
-        user = update.message.from_user
-        
-    if user:
-        conn = sqlite3.connect("bot_users.db")
-        cursor = conn.cursor()
-        # The "OR IGNORE" part is important. It tells SQLite to do nothing if the user_id already exists.
-        cursor.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, first_seen) VALUES (?, ?, datetime('now'))",
-            (user.id, user.username)
-        )
-        conn.commit()
-        conn.close()
-        logging.info(f"User {user.id} ({user.username}) started the bot or returned to the menu.")
-    # ### END NEW ###
-
-    keyboard = []
-    sorted_keys = sorted(FINANCIAL_LINKS.keys())
-    for key in sorted_keys:
-        button = InlineKeyboardButton(FINANCIAL_LINKS[key]["title"], callback_data=key)
-        keyboard.append([button])
-
+    keyboard = [
+        [InlineKeyboardButton("📚 Financial Resources", callback_data="show_resources_menu")],
+        [InlineKeyboardButton("📈 Live Market Data", callback_data="show_market_menu")],
+        [InlineKeyboardButton("👀 My Watchlist", callback_data="show_watchlist")],
+        [InlineKeyboardButton("🛠️ More Tools", callback_data="show_more_tools")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    welcome_text = "Welcome to **Zenith Finance**! 🧭\n\nYour trusted guide to the financial world. Please select an option to begin:"
     
-    welcome_text = (
-        "Welcome to **Zenith Finance**! 🧭\n\n"
-        "Your trusted guide to the financial world. I provide curated links to the best resources for investing, market news, and personal finance.\n\n"
-        "Please select a category below to get started:"
-    )
+    sent_message = await context.bot.send_message(chat_id=chat_id, text=welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+    context.user_data['last_message_id'] = sent_message.message_id
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    await cleanup_previous_message(context, chat_id)
     
-    if isinstance(update, CallbackQuery):
-        query = update
-        await query.answer()
-        await query.edit_message_text(
-            welcome_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    elif isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+    if not context.args:
+        sent_message = await update.message.reply_text("Usage: `/search <company name>`")
+        context.user_data['last_message_id'] = sent_message.message_id
+        return
+        
+    search_term = " ".join(context.args)
+    sent_message = await update.message.reply_text(f"Searching for '{search_term}'...")
+    try:
+        response = requests.get(f"https://query1.finance.yahoo.com/v1/finance/search?q={search_term}", headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        quotes = response.json().get('quotes', [])
+        if not quotes:
+            await sent_message.edit_text(f"No results found for '{search_term}'.")
+            return
+        
+        keyboard = []
+        for q in quotes[:5]:
+            symbol = q.get('symbol'); name = q.get('longname', 'N/A')
+            keyboard.append([
+                InlineKeyboardButton(f"{symbol} ({name[:25]})", callback_data=f"price_{symbol}"),
+                InlineKeyboardButton("➕", callback_data=f"add_from_search_{symbol}")
+            ])
+        await sent_message.edit_text(f"Top results for '{search_term}':", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        await sent_message.edit_text("Search service unavailable.")
+    context.user_data['last_message_id'] = sent_message.message_id
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The /help command will now just show the main menu again."""
-    await start(update, context)
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    await cleanup_previous_message(context, chat_id)
+    
+    if not context.args:
+        sent_message = await update.message.reply_text("Usage: `/price <TICKER>`")
+        context.user_data['last_message_id'] = sent_message.message_id
+        return
+        
+    ticker = " ".join(context.args).upper(); user_id = update.effective_user.id
+    sent_message = await update.message.reply_text(f"Fetching data for `{ticker}`...", parse_mode='Markdown')
+    message_text = await get_stock_price_message(ticker)
+    await sent_message.edit_text(message_text, parse_mode='Markdown', reply_markup=create_stock_details_keyboard(ticker, user_id))
+    context.user_data['last_message_id'] = sent_message.message_id
 
+async def show_watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    query = update.callback_query
+    
+    if query: await query.edit_message_text("Fetching your watchlist... ⏳")
+    else: await update.message.reply_text("Fetching your watchlist... ⏳")
+    
+    tickers = [row[0] for row in db_query("SELECT ticker_symbol FROM watchlist WHERE user_id = ?", (user_id,))]
+    
+    if not tickers:
+        text = "Your watchlist is empty. Add stocks by searching."
+        keyboard = [[InlineKeyboardButton("🔍 Search for a Stock", callback_data="show_market_menu")], [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard)); return
+
+    report_lines = ["**Your Watchlist Summary**\n"]
+    keyboard = []
+    for ticker in tickers:
+        try:
+            info = yf.Ticker(ticker).info
+            price = info.get('regularMarketPrice', 'N/A'); change_pct = info.get('regularMarketChangePercent', 0) * 100
+            currency_code = info.get('currency', ''); display_symbol = {'INR': '₹', 'USD': '$'}.get(currency_code, currency_code)
+            emoji = "📈" if change_pct >= 0 else "📉"
+            report_lines.append(f"• `{ticker}`: {display_symbol}{price:,.2f} ({change_pct:+.2f}%) {emoji}")
+            keyboard.append([InlineKeyboardButton(f"➖ Remove {ticker}", callback_data=f"remove_from_list_{ticker}")])
+            await asyncio.sleep(0.1)
+        except: report_lines.append(f"• `{ticker}`: Error")
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+    final_text = "\n".join(report_lines)
+    await query.edit_message_text(final_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    question_data = random.choice(QUIZ_QUESTIONS)
+    context.user_data['correct_answer_index'] = question_data['correct']
+    context.user_data['explanation'] = question_data['explanation']
+    buttons = [[InlineKeyboardButton(option, callback_data=f"quiz_{i}")] for i, option in enumerate(question_data['options'])]
+    reply_markup = InlineKeyboardMarkup(buttons)
+    message_text = f"**Financial Quiz!**\n\n{question_data['question']}"
+    if query:
+        await query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+    else:
+        await cleanup_previous_message(context, update.effective_chat.id)
+        sent_message = await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+        context.user_data['last_message_id'] = sent_message.message_id
+
+# --- The Main Router for All Button Clicks ---
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles button clicks from the main menu."""
     query = update.callback_query
     await query.answer()
-
-    category_key = query.data
+    key = query.data
+    user_id = query.from_user.id
     
-    if category_key == "main_menu":
-        await start(query, context)
+    if key == "main_menu":
+        # The start function now handles both commands and callbacks cleanly
+        await start(update, context)
         return
 
-    if category_key in FINANCIAL_LINKS:
-        category = FINANCIAL_LINKS[category_key]
+    # Handle all other button presses by editing the current message
+    if key.startswith("price_"):
+        ticker = key.split('_', 1)[1]
+        await query.edit_message_text(f"Fetching price for `{ticker}`...", parse_mode='Markdown')
+        message_text = await get_stock_price_message(ticker)
+        await query.edit_message_text(text=message_text, parse_mode='Markdown', reply_markup=create_stock_details_keyboard(ticker, user_id))
+    
+    elif key.startswith("add_from_search_"):
+        ticker = key.split('_', 3)[3]
+        db_query("INSERT OR IGNORE INTO watchlist (user_id, ticker_symbol) VALUES (?, ?)", (user_id, ticker))
+        await query.answer(f"✅ {ticker} added to Watchlist!")
+        new_keyboard = []
+        for row in query.message.reply_markup.inline_keyboard:
+            price_button, add_button = row
+            if add_button.callback_data == key:
+                new_keyboard.append([price_button])
+            else:
+                new_keyboard.append(row)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+
+    elif key.startswith("add_from_details_"):
+        ticker = key.split('_', 3)[3]
+        db_query("INSERT OR IGNORE INTO watchlist (user_id, ticker_symbol) VALUES (?, ?)", (user_id, ticker))
+        await query.answer("✅ Added to Watchlist!")
+        await query.edit_message_reply_markup(reply_markup=create_stock_details_keyboard(ticker, user_id))
+
+    elif key.startswith("remove_from_details_"):
+        ticker = key.split('_', 3)[3]
+        db_query("DELETE FROM watchlist WHERE user_id = ? AND ticker_symbol = ?", (user_id, ticker))
+        await query.answer("🗑️ Removed from Watchlist!")
+        await query.edit_message_reply_markup(reply_markup=create_stock_details_keyboard(ticker, user_id))
+
+    elif key.startswith("remove_from_list_"):
+        ticker = key.split('_', 3)[3]
+        db_query("DELETE FROM watchlist WHERE user_id = ? AND ticker_symbol = ?", (user_id, ticker))
+        await query.answer(f"🗑️ {ticker} removed!")
+        await show_watchlist_command(update, context)
+
+    elif key.startswith("quiz_"):
+        user_answer = int(key.split('_')[1])
+        correct_answer = context.user_data.get('correct_answer_index')
+        explanation = context.user_data.get('explanation')
+        text = f"✅ **Correct!**\n\n_{explanation}_" if user_answer == correct_answer else f"❌ **Not Quite...**\n\n_{explanation}_"
+        keyboard = [[InlineKeyboardButton("Next Question ➡️", callback_data="start_quiz")], [InlineKeyboardButton("⬅️ Back to Tools", callback_data="show_more_tools")]]
+        await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif key == "show_watchlist": await show_watchlist_command(update, context)
+    elif key == "start_quiz": await quiz_command(update, context)
+    
+    elif key == "show_more_tools":
+        keyboard = [
+            [InlineKeyboardButton("🚀 Market Movers (Moneycontrol)", url="https://www.moneycontrol.com/stocks/marketstats/nsegainer/index.php")],
+            [InlineKeyboardButton("🧠 Financial Quiz", callback_data="start_quiz")],
+            [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]
+        ]
+        await query.edit_message_text("🛠️ **More Tools**\n\nSelect a tool to use:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    elif key == "show_market_menu":
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
+        message = (
+            "📈 **Live Market Data**\n\n"
+            "Use `/search <company name>` to find a stock symbol.\n"
+            "**Example:** `/search Apple`\n\n"
+            "If you already know the symbol, use `/price <symbol>`.\n"
+            "**Example:** `/price AAPL`"
+        )
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         
+    elif key == "show_resources_menu":
+        keyboard = [[InlineKeyboardButton(FINANCIAL_LINKS[k]["title"], callback_data=k)] for k in sorted(FINANCIAL_LINKS.keys())]
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+        await query.edit_message_text("📚 **Financial Resources**\n\nSelect a category to explore:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+    elif key in FINANCIAL_LINKS:
+        category = FINANCIAL_LINKS[key]
         message = f"**{category['title']}**\n_{category['description']}_\n\n"
         for link in category["links"]:
-            message += f"🔗 [{link['name']}]({link['url']})\n"
-            message += f"   - {link['desc']}\n\n"
-            
-        keyboard = [[InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            text=message,
-            parse_mode='Markdown',
-            disable_web_page_preview=True,
-            reply_markup=reply_markup
-        )
+            message += f"🔗 [{link['name']}]({link['url']}) - {link['desc']}\n"
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Resources", callback_data="show_resources_menu")]]
+        await query.edit_message_text(text=message, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
 
-# ### NEW ### - Command for the bot owner to see stats
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shows the total number of users."""
-    user_id = update.message.from_user.id
-
-    if user_id == OWNER_ID:
-        conn = sqlite3.connect("bot_users.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users")
-        user_count = cursor.fetchone()[0]
-        conn.close()
-        await update.message.reply_text(f"📊 Total unique users: {user_count}")
-    else:
-        await update.message.reply_text("Sorry, this command is for the bot owner only.")
-# ### END NEW ###
-
-
+# --- Bot Startup ---
 def main() -> None:
-    """Start the bot."""
-    TOKEN = os.environ.get("BOT_TOKEN")
-    
-    # Paste your token here if you are not using environment variables
-    TOKEN = "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk" 
-
-    if not TOKEN:
-        logging.error("ERROR: Bot token not found.")
-        return
-        
+    TOKEN = os.environ.get("BOT_TOKEN", "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk")
     application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
     
-    # ### NEW ### - Add the handler for the /stats command
-    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("watchlist", show_watchlist_command))
+    application.add_handler(CommandHandler("quiz", quiz_command))
+    
+    application.add_handler(CallbackQueryHandler(button_handler))
 
-    # ### NEW ### - Run the database setup function once on startup
     setup_database()
-
     application.run_polling()
-
 
 if __name__ == "__main__":
     main()
