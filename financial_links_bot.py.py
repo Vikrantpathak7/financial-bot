@@ -13,7 +13,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQuer
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 # --- Constants ---
-OWNER_ID = 1727394308 # <<< IMPORTANT: REPLACE WITH YOUR ID
+OWNER_ID = 1727394308 # <<< IMPORTANT: YOUR TELEGRAM ID
 QUIZ_QUESTIONS = [
     {"question": "What does a high P/E Ratio generally signify?", "options": ["The stock is undervalued", "Investors expect high future growth", "The company has low debt"], "correct": 1, "explanation": "A high P/E ratio often indicates that investors are willing to pay a higher price for each unit of current earnings, usually because they expect earnings to grow significantly in the future."},
     {"question": "What is 'dollar-cost averaging'?", "options": ["Buying stocks only with USD", "Investing a fixed amount of money at regular intervals", "Selling stocks to average your cost basis"], "correct": 1, "explanation": "Dollar-cost averaging is an investment strategy where you invest a total sum of money in small increments over time instead of all at once. The goal is to reduce the impact of volatility."},
@@ -155,6 +155,16 @@ async def cleanup_previous_message(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             logging.warning(f"Could not delete message: {e}")
 
 # --- UI & Formatting Helper Functions ---
+def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    # <<< UPDATED: Helper function for reusability >>>
+    keyboard = [
+        [InlineKeyboardButton("📚 Financial Resources", callback_data="show_resources_menu")],
+        [InlineKeyboardButton("📈 Live Market Data", callback_data="show_market_menu")],
+        [InlineKeyboardButton("👀 My Watchlist", callback_data="show_watchlist")],
+        [InlineKeyboardButton("🛠️ More Tools", callback_data="show_more_tools")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def is_in_watchlist(user_id: int, ticker_symbol: str) -> bool:
     res = db_query("SELECT 1 FROM watchlist WHERE user_id = ? AND ticker_symbol = ?", (user_id, ticker_symbol))
     return bool(res)
@@ -178,7 +188,7 @@ async def get_stock_price_message(ticker_symbol: str) -> str:
         emoji = "📈" if change >= 0 else "📉"
         return (f"**{company_name} ({ticker_symbol})** {emoji}\n\n"
                 f"**Live Price:** {display_symbol}{current_price:,.2f}\n"
-                f"**Change:** {change:+.2f} ({percent_change:+.2f}%)\n"
+                f"**Change:** {change:+.2f} ({percent_change:+.2f}%)\n\n"
                 f"Click buttons below for a full report or to manage your watchlist.")
     except Exception as e:
         logging.error(f"Error in get_stock_price_message: {e}")
@@ -192,17 +202,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await cleanup_previous_message(context, chat_id)
     
-    keyboard = [
-        [InlineKeyboardButton("📚 Financial Resources", callback_data="show_resources_menu")],
-        [InlineKeyboardButton("📈 Live Market Data", callback_data="show_market_menu")],
-        [InlineKeyboardButton("👀 My Watchlist", callback_data="show_watchlist")],
-        [InlineKeyboardButton("🛠️ More Tools", callback_data="show_more_tools")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = get_main_menu_keyboard() # <<< UPDATED: Use helper
     welcome_text = "Welcome to **Zenith Finance**! 🧭\n\nYour trusted guide to the financial world. Please select an option to begin:"
     
     sent_message = await context.bot.send_message(chat_id=chat_id, text=welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
     context.user_data['last_message_id'] = sent_message.message_id
+    
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # <<< NEW: Owner-only command for bot statistics >>>
+    """Shows bot usage statistics (owner only)."""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("Sorry, this is an admin-only command.")
+        return
+
+    try:
+        user_count_result = db_query("SELECT COUNT(*) FROM users;")
+        user_count = user_count_result[0][0] if user_count_result else 0
+        message = f"📊 **Bot Statistics**\n\nTotal Unique Users: `{user_count}`"
+        await update.message.reply_text(message, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Error in stats_command: {e}")
+        await update.message.reply_text("An error occurred while fetching stats.")
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -226,6 +246,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         keyboard = []
         for q in quotes[:5]:
             symbol = q.get('symbol'); name = q.get('longname', 'N/A')
+            if not symbol: continue
             keyboard.append([
                 InlineKeyboardButton(f"{symbol} ({name[:25]})", callback_data=f"price_{symbol}"),
                 InlineKeyboardButton("➕", callback_data=f"add_from_search_{symbol}")
@@ -234,7 +255,6 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         await sent_message.edit_text("Search service unavailable.")
     context.user_data['last_message_id'] = sent_message.message_id
-
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -255,46 +275,82 @@ async def show_watchlist_command(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     query = update.callback_query
     
-    if query: await query.edit_message_text("Fetching your watchlist... ⏳")
-    else: await update.message.reply_text("Fetching your watchlist... ⏳")
+    if query: 
+        await query.edit_message_text("Fetching your watchlist... ⏳")
+    else: 
+        await update.message.reply_text("Fetching your watchlist... ⏳")
     
     tickers = [row[0] for row in db_query("SELECT ticker_symbol FROM watchlist WHERE user_id = ?", (user_id,))]
     
     if not tickers:
-        text = "Your watchlist is empty. Add stocks by searching."
+        text = "Your watchlist is empty. Add stocks using the `/search` command."
         keyboard = [[InlineKeyboardButton("🔍 Search for a Stock", callback_data="show_market_menu")], [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]]
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard)); return
+        if query:
+            await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
 
     report_lines = ["**Your Watchlist Summary**\n"]
     keyboard = []
     for ticker in tickers:
         try:
             info = yf.Ticker(ticker).info
-            price = info.get('regularMarketPrice', 'N/A'); change_pct = info.get('regularMarketChangePercent', 0) * 100
-            currency_code = info.get('currency', ''); display_symbol = {'INR': '₹', 'USD': '$'}.get(currency_code, currency_code)
+            price = info.get('regularMarketPrice', 'N/A')
+            change_pct = info.get('regularMarketChangePercent', 0) * 100
+            currency_code = info.get('currency', '')
+            display_symbol = {'INR': '₹', 'USD': '$'}.get(currency_code, currency_code)
             emoji = "📈" if change_pct >= 0 else "📉"
             report_lines.append(f"• `{ticker}`: {display_symbol}{price:,.2f} ({change_pct:+.2f}%) {emoji}")
             keyboard.append([InlineKeyboardButton(f"➖ Remove {ticker}", callback_data=f"remove_from_list_{ticker}")])
-            await asyncio.sleep(0.1)
-        except: report_lines.append(f"• `{ticker}`: Error")
+            await asyncio.sleep(0.1) # Be respectful to the API
+        except: 
+            report_lines.append(f"• `{ticker}`: Error fetching data")
     
     keyboard.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
     final_text = "\n".join(report_lines)
-    await query.edit_message_text(final_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+    if query:
+        await query.edit_message_text(final_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # <<< UPDATED: Overhauled quiz logic >>>
     query = update.callback_query
-    question_data = random.choice(QUIZ_QUESTIONS)
+    chat_id = update.effective_chat.id
+
+    # Initialize or get the list of unasked question indices
+    if 'unasked_quiz_indices' not in context.user_data or not context.user_data['unasked_quiz_indices']:
+        indices = list(range(len(QUIZ_QUESTIONS)))
+        random.shuffle(indices)
+        context.user_data['unasked_quiz_indices'] = indices
+
+    unasked_indices = context.user_data['unasked_quiz_indices']
+
+    # Check if all questions have been asked
+    if not unasked_indices:
+        text = "🎉 **Quiz Complete!**\n\nYou've answered all the questions. Well done!"
+        reply_markup = get_main_menu_keyboard()
+        if query:
+            await query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        else: # Should not happen with buttons, but good practice
+            await context.bot.send_message(chat_id, text, parse_mode='Markdown', reply_markup=reply_markup)
+        # Clean up quiz data for the next round
+        context.user_data.pop('unasked_quiz_indices', None)
+        return
+
+    # Pop the next question index to ensure it's not asked again
+    question_index = unasked_indices.pop()
+    question_data = QUIZ_QUESTIONS[question_index]
+
     context.user_data['correct_answer_index'] = question_data['correct']
     context.user_data['explanation'] = question_data['explanation']
+    
     buttons = [[InlineKeyboardButton(option, callback_data=f"quiz_{i}")] for i, option in enumerate(question_data['options'])]
     reply_markup = InlineKeyboardMarkup(buttons)
-    message_text = f"**Financial Quiz!**\n\n{question_data['question']}"
+    message_text = f"**Financial Quiz!** ({len(QUIZ_QUESTIONS) - len(unasked_indices)}/{len(QUIZ_QUESTIONS)})\n\n{question_data['question']}"
+    
     if query:
         await query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
     else:
-        await cleanup_previous_message(context, update.effective_chat.id)
-        sent_message = await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+        await cleanup_previous_message(context, chat_id)
+        sent_message = await context.bot.send_message(chat_id, message_text, reply_markup=reply_markup, parse_mode='Markdown')
         context.user_data['last_message_id'] = sent_message.message_id
 
 # --- The Main Router for All Button Clicks ---
@@ -305,11 +361,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = query.from_user.id
     
     if key == "main_menu":
-        # The start function now handles both commands and callbacks cleanly
         await start(update, context)
         return
 
-    # Handle all other button presses by editing the current message
+    if key == "start_quiz": # <<< UPDATED: Route to the new quiz function
+        await start_quiz(update, context)
+        return
+        
     if key.startswith("price_"):
         ticker = key.split('_', 1)[1]
         await query.edit_message_text(f"Fetching price for `{ticker}`...", parse_mode='Markdown')
@@ -356,12 +414,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif key == "show_watchlist": await show_watchlist_command(update, context)
-    elif key == "start_quiz": await quiz_command(update, context)
     
     elif key == "show_more_tools":
+        # Reset quiz progress if user navigates back to tools
+        context.user_data.pop('unasked_quiz_indices', None) 
         keyboard = [
             [InlineKeyboardButton("🚀 Market Movers (Moneycontrol)", url="https://www.moneycontrol.com/stocks/marketstats/nsegainer/index.php")],
-            [InlineKeyboardButton("🧠 Financial Quiz", callback_data="start_quiz")],
+            [InlineKeyboardButton("🧠 Financial Quiz", callback_data="start_quiz")], # <<< UPDATED: This now resets the quiz
             [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]
         ]
         await query.edit_message_text("🛠️ **More Tools**\n\nSelect a tool to use:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -392,17 +451,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- Bot Startup ---
 def main() -> None:
+    # Use environment variable for token, with a placeholder for local testing
     TOKEN = os.environ.get("BOT_TOKEN", "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk")
+    if TOKEN == "8035433844:AAEVK7XMtfgrGFj__kInF0yCr3KuPdx6JEk":
+        logging.warning("Using a placeholder Bot Token. Please set the BOT_TOKEN environment variable.")
+        
     application = Application.builder().token(TOKEN).build()
     
+    # Register command handlers
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats_command)) # <<< NEW: Added stats handler
     application.add_handler(CommandHandler("search", search_command))
     application.add_handler(CommandHandler("price", price_command))
     application.add_handler(CommandHandler("watchlist", show_watchlist_command))
-    application.add_handler(CommandHandler("quiz", quiz_command))
+    # application.add_handler(CommandHandler("quiz", start_quiz)) # optional: allow starting quiz with /quiz
     
+    # Register the main callback handler for all buttons
     application.add_handler(CallbackQueryHandler(button_handler))
 
+    # Set up the database and run the bot
     setup_database()
     application.run_polling()
 
